@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
 	"net/http"
@@ -152,6 +153,15 @@ func (store *MessageStore) MarkUnreadIfZero(jid string) error {
 	return err
 }
 
+// UpdateMessageContent updates the content of an existing message in messages.db
+func (store *MessageStore) UpdateMessageContent(id, chatJID, content string) error {
+	_, err := store.db.Exec(
+		"UPDATE messages SET content = ? WHERE id = ? AND chat_jid = ?",
+		content, id, chatJID,
+	)
+	return err
+}
+
 // UpsertGroupMemberTag stores or updates a member's group tag in group_member_tags
 func (store *MessageStore) UpsertGroupMemberTag(chatJID, userJID, tag string, updatedAt int64) error {
 	if chatJID == "" || userJID == "" {
@@ -287,6 +297,50 @@ type SendMessageRequest struct {
 	Recipient string `json:"recipient"`
 	Message   string `json:"message"`
 	MediaPath string `json:"media_path,omitempty"`
+}
+
+// EditMessageRequest represents the request body for the edit message API
+type EditMessageRequest struct {
+	ChatJID    string `json:"chat_jid"`
+	MessageID  string `json:"message_id"`
+	NewMessage string `json:"new_message"`
+}
+
+func parseRecipientJID(recipient string) (types.JID, error) {
+	if strings.Contains(recipient, "@") {
+		return types.ParseJID(recipient)
+	}
+	return types.JID{
+		User:   recipient,
+		Server: "s.whatsapp.net",
+	}, nil
+}
+
+// editWhatsAppMessage edits a previously sent text message on WhatsApp and updates messages.db
+func editWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, chatJID, messageID, newMessage string) (bool, string) {
+	if !client.IsConnected() {
+		return false, "Not connected to WhatsApp"
+	}
+
+	recipientJID, err := parseRecipientJID(chatJID)
+	if err != nil {
+		return false, fmt.Sprintf("Error parsing JID: %v", err)
+	}
+
+	editMsg := client.BuildEdit(recipientJID, types.MessageID(messageID), &waE2E.Message{
+		Conversation: proto.String(newMessage),
+	})
+
+	_, err = client.SendMessage(context.Background(), recipientJID, editMsg)
+	if err != nil {
+		return false, fmt.Sprintf("Error editing message: %v", err)
+	}
+
+	if err := messageStore.UpdateMessageContent(messageID, recipientJID.String(), newMessage); err != nil {
+		fmt.Printf("Warning: edited on WhatsApp but failed to update messages.db: %v\n", err)
+	}
+
+	return true, fmt.Sprintf("Message %s edited in %s", messageID, recipientJID.String())
 }
 
 // Function to send a WhatsApp message
@@ -529,6 +583,22 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 				ts = msg.Info.Timestamp.Unix()
 			}
 			_ = messageStore.UpsertGroupMemberTag(chatJID, msg.Info.Sender.ToNonAD().String(), label.GetLabel(), ts)
+		}
+	}
+
+	// Handle incoming message edits
+	var editPM *waE2E.ProtocolMessage
+	if em := msg.Message.GetEditedMessage(); em != nil && em.GetMessage() != nil {
+		editPM = em.GetMessage().GetProtocolMessage()
+	} else if pm := msg.Message.GetProtocolMessage(); pm != nil {
+		editPM = pm
+	}
+	if editPM != nil && editPM.GetType() == waE2E.ProtocolMessage_MESSAGE_EDIT && editPM.GetKey() != nil && editPM.GetEditedMessage() != nil {
+		editedText := extractTextContent(editPM.GetEditedMessage())
+		if editedText != "" {
+			if err := messageStore.UpdateMessageContent(editPM.GetKey().GetID(), chatJID, editedText); err != nil {
+				logger.Warnf("Failed to update edited message in DB: %v", err)
+			}
 		}
 	}
 
@@ -795,6 +865,16 @@ type GroupParticipantsResponse struct {
 	GroupName        string                 `json:"group_name,omitempty"`
 	ParticipantCount int                    `json:"participant_count,omitempty"`
 	Participants     []GroupParticipantInfo `json:"participants,omitempty"`
+}
+
+type ProfilePictureResponse struct {
+	Success  bool   `json:"success"`
+	Message  string `json:"message,omitempty"`
+	JID      string `json:"jid,omitempty"`
+	ID       string `json:"id,omitempty"`
+	Type     string `json:"type,omitempty"`
+	URL      string `json:"url,omitempty"`
+	FilePath string `json:"file_path,omitempty"`
 }
 
 // extractMemberLabel extracts a Group Member Tag from ProtocolMessage or message ContextInfo
@@ -1064,6 +1144,191 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			GroupName:        groupInfo.Name,
 			ParticipantCount: len(participants),
 			Participants:     participants,
+		})
+	})
+
+	// Handler for editing a previously sent message
+	http.HandleFunc("/api/edit", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req EditMessageRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+
+		if req.ChatJID == "" || req.MessageID == "" || req.NewMessage == "" {
+			http.Error(w, "chat_jid, message_id, and new_message are required", http.StatusBadRequest)
+			return
+		}
+
+		success, message := editWhatsAppMessage(client, messageStore, req.ChatJID, req.MessageID, req.NewMessage)
+		w.Header().Set("Content-Type", "application/json")
+		if !success {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+		json.NewEncoder(w).Encode(SendMessageResponse{
+			Success: success,
+			Message: message,
+		})
+	})
+
+	// Handler for fetching (and optionally downloading) a user's or group's profile picture
+	http.HandleFunc("/api/profile-picture", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		target := r.URL.Query().Get("jid")
+		preview := r.URL.Query().Get("preview") == "true"
+		download := r.URL.Query().Get("download") != "false"
+
+		if target == "" && r.Method == http.MethodPost {
+			var body struct {
+				JID      string `json:"jid"`
+				Preview  bool   `json:"preview"`
+				Download *bool  `json:"download"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err == nil {
+				target = body.JID
+				preview = body.Preview
+				if body.Download != nil {
+					download = *body.Download
+				}
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if target == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(ProfilePictureResponse{
+				Success: false,
+				Message: "jid is required",
+			})
+			return
+		}
+
+		if !client.IsConnected() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(ProfilePictureResponse{
+				Success: false,
+				Message: "Not connected to WhatsApp",
+			})
+			return
+		}
+
+		targetJID, err := parseRecipientJID(target)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(ProfilePictureResponse{
+				Success: false,
+				Message: fmt.Sprintf("Error parsing JID: %v", err),
+			})
+			return
+		}
+
+		params := &whatsmeow.GetProfilePictureParams{Preview: preview}
+		picInfo, err := client.GetProfilePictureInfo(context.Background(), targetJID, params)
+		if (err != nil || picInfo == nil) && targetJID.Server == types.HiddenUserServer && client.Store != nil && client.Store.LIDs != nil {
+			if pnJID, lidErr := client.Store.LIDs.GetPNForLID(context.Background(), targetJID); lidErr == nil && !pnJID.IsEmpty() {
+				if altInfo, altErr := client.GetProfilePictureInfo(context.Background(), pnJID, params); altErr == nil && altInfo != nil {
+					picInfo = altInfo
+					err = nil
+					targetJID = pnJID
+				}
+			}
+		}
+
+		if err != nil {
+			json.NewEncoder(w).Encode(ProfilePictureResponse{
+				Success: false,
+				JID:     targetJID.String(),
+				Message: fmt.Sprintf("Could not retrieve profile picture: %v", err),
+			})
+			return
+		}
+		if picInfo == nil || picInfo.URL == "" {
+			json.NewEncoder(w).Encode(ProfilePictureResponse{
+				Success: false,
+				JID:     targetJID.String(),
+				Message: "No profile picture available",
+			})
+			return
+		}
+
+		filePath := ""
+		if download {
+			picDir := filepath.Join("store", "profile_pictures")
+			if mkErr := os.MkdirAll(picDir, 0755); mkErr != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(ProfilePictureResponse{
+					Success: false,
+					JID:     targetJID.String(),
+					Message: fmt.Sprintf("Failed to create profile_pictures directory: %v", mkErr),
+				})
+				return
+			}
+			safeJID := strings.NewReplacer("@", "_", ":", "_").Replace(targetJID.String())
+			suffix := "full"
+			if preview {
+				suffix = "preview"
+			}
+			localPath := filepath.Join(picDir, fmt.Sprintf("%s_%s_%s.jpg", safeJID, picInfo.ID, suffix))
+			absPath, absErr := filepath.Abs(localPath)
+			if absErr == nil {
+				localPath = absPath
+			}
+
+			if _, statErr := os.Stat(localPath); statErr != nil {
+				httpResp, httpErr := http.Get(picInfo.URL)
+				if httpErr != nil {
+					w.WriteHeader(http.StatusInternalServerError)
+					json.NewEncoder(w).Encode(ProfilePictureResponse{
+						Success: false,
+						JID:     targetJID.String(),
+						URL:     picInfo.URL,
+						Message: fmt.Sprintf("Failed to download profile picture: %v", httpErr),
+					})
+					return
+				}
+				imgBytes, readErr := io.ReadAll(httpResp.Body)
+				httpResp.Body.Close()
+				if readErr != nil || httpResp.StatusCode != http.StatusOK {
+					w.WriteHeader(http.StatusInternalServerError)
+					json.NewEncoder(w).Encode(ProfilePictureResponse{
+						Success: false,
+						JID:     targetJID.String(),
+						URL:     picInfo.URL,
+						Message: fmt.Sprintf("Failed to read profile picture (HTTP %d): %v", httpResp.StatusCode, readErr),
+					})
+					return
+				}
+				if writeErr := os.WriteFile(localPath, imgBytes, 0644); writeErr != nil {
+					w.WriteHeader(http.StatusInternalServerError)
+					json.NewEncoder(w).Encode(ProfilePictureResponse{
+						Success: false,
+						JID:     targetJID.String(),
+						URL:     picInfo.URL,
+						Message: fmt.Sprintf("Failed to save profile picture: %v", writeErr),
+					})
+					return
+				}
+			}
+			filePath = localPath
+		}
+
+		json.NewEncoder(w).Encode(ProfilePictureResponse{
+			Success:  true,
+			Message:  "Profile picture retrieved",
+			JID:      targetJID.String(),
+			ID:       picInfo.ID,
+			Type:     picInfo.Type,
+			URL:      picInfo.URL,
+			FilePath: filePath,
 		})
 	})
 

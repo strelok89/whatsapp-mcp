@@ -1091,3 +1091,58 @@ def get_group_participants(chat_jid: str) -> dict:
         return {"success": False, "message": f"Request error: {str(e)}"}
     except Exception as e:
         return {"success": False, "message": f"Unexpected error: {str(e)}"}
+
+
+def edit_message(chat_jid: str, message_id: str, new_message: str) -> Tuple[bool, str]:
+    """Edit a previously sent WhatsApp text message."""
+    try:
+        if not chat_jid:
+            return False, "chat_jid must be provided"
+        if not message_id:
+            return False, "message_id must be provided"
+        if not new_message:
+            return False, "new_message must be provided"
+
+        url = f"{WHATSAPP_API_BASE_URL}/edit"
+        payload = {
+            "chat_jid": chat_jid,
+            "message_id": message_id,
+            "new_message": new_message,
+        }
+        response = requests.post(url, json=payload, timeout=15)
+        if response.status_code == 200:
+            result = response.json()
+            return result.get("success", False), result.get("message", "Unknown response")
+        return False, f"Error: HTTP {response.status_code} - {response.text}"
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except json.JSONDecodeError:
+        return False, f"Error parsing response: {response.text}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
+
+def get_profile_picture(jid: str, preview: bool = False, download: bool = True) -> dict:
+    """Fetch (and optionally download) a WhatsApp user's or group's profile picture."""
+    if not jid:
+        return {"success": False, "message": "jid must be provided"}
+
+    try:
+        response = requests.get(
+            f"{WHATSAPP_API_BASE_URL}/profile-picture",
+            params={
+                "jid": jid,
+                "preview": "true" if preview else "false",
+                "download": "true" if download else "false",
+            },
+            timeout=15,
+        )
+        if response.status_code == 200:
+            return response.json()
+        return {"success": False, "message": f"Error: HTTP {response.status_code} - {response.text}"}
+    except requests.RequestException as e:
+        return {"success": False, "message": f"Request error: {str(e)}"}
+    except json.JSONDecodeError:
+        return {"success": False, "message": f"Error parsing response: {response.text}"}
+    except Exception as e:
+        return {"success": False, "message": f"Unexpected error: {str(e)}"}

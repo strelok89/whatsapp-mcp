@@ -14,6 +14,8 @@ from whatsapp import (
     send_audio_message as whatsapp_audio_voice_message,
     download_media as whatsapp_download_media,
     get_group_participants as whatsapp_get_group_participants,
+    edit_message as whatsapp_edit_message,
+    get_profile_picture as whatsapp_get_profile_picture,
 )
 
 # Initialize FastMCP server
@@ -264,6 +266,38 @@ def get_group_participants(chat_jid: str) -> Dict[str, Any]:
         A dictionary containing group metadata and a list of participants with jid, phone_number, lid, name, role, and member_tag
     """
     return whatsapp_get_group_participants(chat_jid)
+
+@mcp.tool(structured_output=False)
+def edit_message(chat_jid: str, message_id: str, new_message: str) -> Dict[str, Any]:
+    """Edit a previously sent WhatsApp text message (within WhatsApp's edit window).
+    
+    Args:
+        chat_jid: The JID or phone number of the chat containing the message
+        message_id: The ID of the sent message to edit
+        new_message: The replacement text content
+    
+    Returns:
+        A dictionary containing success status and a status message
+    """
+    success, status_message = whatsapp_edit_message(chat_jid, message_id, new_message)
+    return {
+        "success": success,
+        "message": status_message,
+    }
+
+@mcp.tool(structured_output=False)
+def get_profile_picture(jid: str, preview: bool = False, download: bool = True) -> Dict[str, Any]:
+    """Get a WhatsApp user's or group's profile picture URL and download it locally.
+    
+    Args:
+        jid: Phone number (e.g., "972545417509") or JID (e.g., "972545417509@s.whatsapp.net", "@lid", or "@g.us")
+        preview: If True, fetch thumbnail preview instead of full-resolution image (default False)
+        download: If True, download the image to whatsapp-bridge/store/profile_pictures/ and return file_path (default True)
+    
+    Returns:
+        A dictionary containing success status, jid, id, type, url, and local file_path
+    """
+    return whatsapp_get_profile_picture(jid, preview=preview, download=download)
 
 if __name__ == "__main__":
     # Initialize and run the server
