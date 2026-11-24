@@ -64,7 +64,8 @@ func NewMessageStore() (*MessageStore, error) {
 		CREATE TABLE IF NOT EXISTS chats (
 			jid TEXT PRIMARY KEY,
 			name TEXT,
-			last_message_time TIMESTAMP
+			last_message_time TIMESTAMP,
+			unread_count INTEGER NOT NULL DEFAULT 0
 		);
 		
 		CREATE TABLE IF NOT EXISTS messages (
@@ -90,6 +91,13 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
+	// Migrate existing chats table to include unread_count if missing
+	_, err = db.Exec("ALTER TABLE chats ADD COLUMN unread_count INTEGER NOT NULL DEFAULT 0")
+	if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+		db.Close()
+		return nil, fmt.Errorf("failed to migrate chats table: %v", err)
+	}
+
 	return &MessageStore{db: db}, nil
 }
 
@@ -101,9 +109,36 @@ func (store *MessageStore) Close() error {
 // Store a chat in the database
 func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
 	_, err := store.db.Exec(
-		"INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
+		`INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)
+		 ON CONFLICT(jid) DO UPDATE SET
+			name = COALESCE(NULLIF(excluded.name, ''), chats.name),
+			last_message_time = CASE
+				WHEN chats.last_message_time IS NULL OR excluded.last_message_time > chats.last_message_time THEN excluded.last_message_time
+				ELSE chats.last_message_time
+			END`,
 		jid, name, lastMessageTime,
 	)
+	return err
+}
+
+// SetUnreadCount sets the unread message count for a chat
+func (store *MessageStore) SetUnreadCount(jid string, count int) error {
+	if count < 0 {
+		count = 0
+	}
+	_, err := store.db.Exec("UPDATE chats SET unread_count = ? WHERE jid = ?", count, jid)
+	return err
+}
+
+// IncrementUnreadCount increments the unread message count for a chat
+func (store *MessageStore) IncrementUnreadCount(jid string) error {
+	_, err := store.db.Exec("UPDATE chats SET unread_count = COALESCE(unread_count, 0) + 1 WHERE jid = ?", jid)
+	return err
+}
+
+// MarkUnreadIfZero sets unread_count to 1 if it is currently 0
+func (store *MessageStore) MarkUnreadIfZero(jid string) error {
+	_, err := store.db.Exec("UPDATE chats SET unread_count = CASE WHEN COALESCE(unread_count, 0) = 0 THEN 1 ELSE unread_count END WHERE jid = ?", jid)
 	return err
 }
 
@@ -416,11 +451,22 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
 	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
+	if (name == "" || name == msg.Info.Chat.User) && !msg.Info.IsFromMe && msg.Info.PushName != "" && msg.Info.Chat.Server != "g.us" {
+		name = msg.Info.PushName
+	}
 
 	// Update chat in database with the message timestamp (keeps last message time updated)
 	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
 	if err != nil {
 		logger.Warnf("Failed to store chat: %v", err)
+	} else if msg.Info.IsFromMe {
+		if err := messageStore.SetUnreadCount(chatJID, 0); err != nil {
+			logger.Warnf("Failed to reset unread count: %v", err)
+		}
+	} else if msg.Info.Chat.Server != types.BroadcastServer {
+		if err := messageStore.IncrementUnreadCount(chatJID); err != nil {
+			logger.Warnf("Failed to increment unread count: %v", err)
+		}
 	}
 
 	// Extract text content
@@ -641,7 +687,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -800,14 +846,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -844,6 +890,20 @@ func main() {
 		case *events.HistorySync:
 			// Process history sync events
 			handleHistorySync(client, messageStore, v, logger)
+
+		case *events.MarkChatAsRead:
+			if v.Action != nil {
+				if v.Action.GetRead() {
+					_ = messageStore.SetUnreadCount(v.JID.String(), 0)
+				} else {
+					_ = messageStore.MarkUnreadIfZero(v.JID.String())
+				}
+			}
+
+		case *events.Receipt:
+			if v.Type == types.ReceiptTypeReadSelf {
+				_ = messageStore.SetUnreadCount(v.Chat.String(), 0)
+			}
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
@@ -973,7 +1033,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -987,16 +1047,50 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		// This is an individual contact
 		logger.Infof("Getting name for contact: %s", chatJID)
 
-		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
-		if err == nil && contact.FullName != "" {
-			name = contact.FullName
-		} else if sender != "" {
-			// Fallback to sender
-			name = sender
-		} else {
-			// Last fallback to JID
-			name = jid.User
+		// Resolve @lid to phone-number JID when available
+		lookupJIDs := []types.JID{jid}
+		var resolvedPN string
+		if jid.Server == types.HiddenUserServer && client.Store != nil && client.Store.LIDs != nil {
+			if pnJID, err := client.Store.LIDs.GetPNForLID(context.Background(), jid); err == nil && !pnJID.IsEmpty() {
+				resolvedPN = pnJID.User
+				lookupJIDs = append([]types.JID{pnJID}, lookupJIDs...)
+			}
+		}
+
+		// Try saved contact name -> push name -> business name
+		for _, candidateJID := range lookupJIDs {
+			contact, err := client.Store.Contacts.GetContact(context.Background(), candidateJID)
+			if err != nil {
+				continue
+			}
+			if contact.FullName != "" {
+				name = contact.FullName
+				break
+			}
+			if contact.FirstName != "" {
+				name = contact.FirstName
+				break
+			}
+			if contact.PushName != "" {
+				name = contact.PushName
+				break
+			}
+			if contact.BusinessName != "" {
+				name = contact.BusinessName
+				break
+			}
+		}
+
+		if name == "" {
+			if resolvedPN != "" {
+				name = resolvedPN
+			} else if sender != "" {
+				// Fallback to sender
+				name = sender
+			} else {
+				// Last fallback to JID
+				name = jid.User
+			}
 		}
 
 		logger.Infof("Using contact name: %s", name)
@@ -1046,6 +1140,9 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 			}
 
 			messageStore.StoreChat(chatJID, name, timestamp)
+			if conversation.UnreadCount != nil {
+				_ = messageStore.SetUnreadCount(chatJID, int(conversation.GetUnreadCount()))
+			}
 
 			// Store messages
 			for _, msg := range messages {
