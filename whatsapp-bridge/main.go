@@ -25,6 +25,7 @@ import (
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
+	waE2E "go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -86,6 +87,14 @@ func NewMessageStore() (*MessageStore, error) {
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
+
+		CREATE TABLE IF NOT EXISTS group_member_tags (
+			chat_jid TEXT,
+			user_jid TEXT,
+			member_tag TEXT,
+			updated_at INTEGER,
+			PRIMARY KEY (chat_jid, user_jid)
+		);
 	`)
 	if err != nil {
 		db.Close()
@@ -141,6 +150,48 @@ func (store *MessageStore) IncrementUnreadCount(jid string) error {
 func (store *MessageStore) MarkUnreadIfZero(jid string) error {
 	_, err := store.db.Exec("UPDATE chats SET unread_count = CASE WHEN COALESCE(unread_count, 0) = 0 THEN 1 ELSE unread_count END WHERE jid = ?", jid)
 	return err
+}
+
+// UpsertGroupMemberTag stores or updates a member's group tag in group_member_tags
+func (store *MessageStore) UpsertGroupMemberTag(chatJID, userJID, tag string, updatedAt int64) error {
+	if chatJID == "" || userJID == "" {
+		return nil
+	}
+	_, err := store.db.Exec(
+		`INSERT INTO group_member_tags (chat_jid, user_jid, member_tag, updated_at)
+		 VALUES (?, ?, ?, ?)
+		 ON CONFLICT(chat_jid, user_jid) DO UPDATE SET
+			member_tag = excluded.member_tag,
+			updated_at = excluded.updated_at
+		 WHERE excluded.updated_at >= group_member_tags.updated_at OR group_member_tags.updated_at IS NULL`,
+		chatJID, userJID, tag, updatedAt,
+	)
+	return err
+}
+
+// GetGroupMemberTags returns a map of user_jid (and user part) -> member_tag for a group
+func (store *MessageStore) GetGroupMemberTags(chatJID string) (map[string]string, error) {
+	rows, err := store.db.Query(
+		"SELECT user_jid, member_tag FROM group_member_tags WHERE chat_jid = ? AND member_tag != ''",
+		chatJID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	tags := make(map[string]string)
+	for rows.Next() {
+		var userJID, tag string
+		if err := rows.Scan(&userJID, &tag); err != nil {
+			return nil, err
+		}
+		tags[userJID] = tag
+		if idx := strings.Index(userJID, "@"); idx > 0 {
+			tags[userJID[:idx]] = tag
+		}
+	}
+	return tags, nil
 }
 
 // Store a message in the database
@@ -470,6 +521,17 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		}
 	}
 
+	// Extract member label/tag if present (can arrive via ProtocolMessage with no text/media)
+	if msg.Info.Chat.Server == "g.us" {
+		if label := extractMemberLabel(msg.Message); label != nil {
+			ts := label.GetLabelTimestamp()
+			if ts == 0 {
+				ts = msg.Info.Timestamp.Unix()
+			}
+			_ = messageStore.UpsertGroupMemberTag(chatJID, msg.Info.Sender.ToNonAD().String(), label.GetLabel(), ts)
+		}
+	}
+
 	// Extract text content
 	content := extractTextContent(msg.Message)
 
@@ -717,6 +779,47 @@ func extractDirectPathFromURL(rawURL string) string {
 	return "/" + parts[1]
 }
 
+type GroupParticipantInfo struct {
+	JID         string `json:"jid"`
+	PhoneNumber string `json:"phone_number"`
+	LID         string `json:"lid,omitempty"`
+	Name        string `json:"name"`
+	Role        string `json:"role"`
+	MemberTag   string `json:"member_tag,omitempty"`
+}
+
+type GroupParticipantsResponse struct {
+	Success          bool                   `json:"success"`
+	Message          string                 `json:"message,omitempty"`
+	GroupJID         string                 `json:"group_jid,omitempty"`
+	GroupName        string                 `json:"group_name,omitempty"`
+	ParticipantCount int                    `json:"participant_count,omitempty"`
+	Participants     []GroupParticipantInfo `json:"participants,omitempty"`
+}
+
+// extractMemberLabel extracts a Group Member Tag from ProtocolMessage or message ContextInfo
+func extractMemberLabel(msg *waProto.Message) *waE2E.MemberLabel {
+	if msg == nil {
+		return nil
+	}
+	if pm := msg.GetProtocolMessage(); pm != nil && pm.GetMemberLabel() != nil {
+		return pm.GetMemberLabel()
+	}
+	for _, ci := range []*waE2E.ContextInfo{
+		msg.GetExtendedTextMessage().GetContextInfo(),
+		msg.GetImageMessage().GetContextInfo(),
+		msg.GetVideoMessage().GetContextInfo(),
+		msg.GetAudioMessage().GetContextInfo(),
+		msg.GetDocumentMessage().GetContextInfo(),
+		msg.GetStickerMessage().GetContextInfo(),
+	} {
+		if ci != nil && ci.GetMemberLabel() != nil {
+			return ci.GetMemberLabel()
+		}
+	}
+	return nil
+}
+
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
 	// Handler for sending messages
@@ -813,6 +916,154 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Message:  fmt.Sprintf("Successfully downloaded %s media", mediaType),
 			Filename: filename,
 			Path:     path,
+		})
+	})
+
+	// Handler for listing group participants and their group member tags
+	http.HandleFunc("/api/group-participants", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		chatJID := r.URL.Query().Get("chat_jid")
+		if chatJID == "" && r.Method == http.MethodPost {
+			var body struct {
+				ChatJID string `json:"chat_jid"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			chatJID = body.ChatJID
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if chatJID == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(GroupParticipantsResponse{
+				Success: false,
+				Message: "chat_jid is required",
+			})
+			return
+		}
+
+		jid, err := types.ParseJID(chatJID)
+		if err != nil || jid.Server != types.GroupServer {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(GroupParticipantsResponse{
+				Success: false,
+				Message: "chat_jid must be a valid group JID ending in @g.us",
+			})
+			return
+		}
+
+		groupInfo, err := client.GetGroupInfo(context.Background(), jid)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(GroupParticipantsResponse{
+				Success: false,
+				Message: fmt.Sprintf("Failed to get group info: %v", err),
+			})
+			return
+		}
+
+		tags, _ := messageStore.GetGroupMemberTags(chatJID)
+		participants := make([]GroupParticipantInfo, 0, len(groupInfo.Participants))
+		for _, p := range groupInfo.Participants {
+			pnJID := p.PhoneNumber
+			lidJID := p.LID
+			if lidJID.IsEmpty() && p.JID.Server == types.HiddenUserServer {
+				lidJID = p.JID
+			}
+			if pnJID.IsEmpty() && !lidJID.IsEmpty() && client.Store != nil && client.Store.LIDs != nil {
+				if resolved, err := client.Store.LIDs.GetPNForLID(context.Background(), lidJID); err == nil && !resolved.IsEmpty() {
+					pnJID = resolved
+				}
+			}
+			if pnJID.IsEmpty() && p.JID.Server == types.DefaultUserServer {
+				pnJID = p.JID
+			}
+
+			resolvedJID := p.JID.String()
+			if !pnJID.IsEmpty() {
+				resolvedJID = pnJID.String()
+			}
+			phoneNumber := ""
+			if !pnJID.IsEmpty() {
+				phoneNumber = pnJID.User
+			} else {
+				phoneNumber = p.JID.User
+			}
+
+			name := ""
+			var lookupJIDs []types.JID
+			if !pnJID.IsEmpty() {
+				lookupJIDs = append(lookupJIDs, pnJID)
+			}
+			lookupJIDs = append(lookupJIDs, p.JID)
+			if !lidJID.IsEmpty() && lidJID != p.JID {
+				lookupJIDs = append(lookupJIDs, lidJID)
+			}
+			for _, candidate := range lookupJIDs {
+				contact, err := client.Store.Contacts.GetContact(context.Background(), candidate)
+				if err != nil {
+					continue
+				}
+				if contact.FullName != "" {
+					name = contact.FullName
+					break
+				}
+				if contact.FirstName != "" {
+					name = contact.FirstName
+					break
+				}
+				if contact.PushName != "" {
+					name = contact.PushName
+					break
+				}
+				if contact.BusinessName != "" {
+					name = contact.BusinessName
+					break
+				}
+			}
+			if name == "" && p.DisplayName != "" {
+				name = p.DisplayName
+			}
+			if name == "" {
+				name = phoneNumber
+			}
+
+			role := "member"
+			if p.IsSuperAdmin {
+				role = "superadmin"
+			} else if p.IsAdmin {
+				role = "admin"
+			}
+
+			memberTag := ""
+			for _, key := range []string{p.JID.String(), lidJID.String(), pnJID.String(), p.JID.User, lidJID.User, pnJID.User} {
+				if key != "" {
+					if t, ok := tags[key]; ok {
+						memberTag = t
+						break
+					}
+				}
+			}
+
+			participants = append(participants, GroupParticipantInfo{
+				JID:         resolvedJID,
+				PhoneNumber: phoneNumber,
+				LID:         lidJID.String(),
+				Name:        name,
+				Role:        role,
+				MemberTag:   memberTag,
+			})
+		}
+
+		json.NewEncoder(w).Encode(GroupParticipantsResponse{
+			Success:          true,
+			GroupJID:         chatJID,
+			GroupName:        groupInfo.Name,
+			ParticipantCount: len(participants),
+			Participants:     participants,
 		})
 	})
 
@@ -1117,6 +1368,17 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 
 		// Get appropriate chat name by passing the history sync conversation directly
 		name := GetChatName(client, messageStore, jid, chatJID, conversation, "", logger)
+
+		// Store any group member tags synced in conversation participant list
+		if jid.Server == types.GroupServer {
+			for _, gp := range conversation.GetParticipant() {
+				if gp == nil || gp.GetMemberLabel() == nil {
+					continue
+				}
+				label := gp.GetMemberLabel()
+				_ = messageStore.UpsertGroupMemberTag(chatJID, gp.GetUserJID(), label.GetLabel(), label.GetLabelTimestamp())
+			}
+		}
 
 		// Process messages
 		messages := conversation.Messages

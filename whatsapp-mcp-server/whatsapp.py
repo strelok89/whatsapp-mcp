@@ -986,3 +986,108 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         return None
+
+
+def get_group_participants(chat_jid: str) -> dict:
+    """List participants of a WhatsApp group along with roles and group member tags."""
+    if not chat_jid or not chat_jid.endswith("@g.us"):
+        return {
+            "success": False,
+            "message": "chat_jid must be a valid group JID ending with @g.us",
+        }
+
+    try:
+        response = requests.get(
+            f"{WHATSAPP_API_BASE_URL}/group-participants",
+            params={"chat_jid": chat_jid},
+            timeout=15,
+        )
+        if response.status_code != 200:
+            return {
+                "success": False,
+                "message": f"Error: HTTP {response.status_code} - {response.text}",
+            }
+
+        data = response.json()
+        if not data.get("success", False):
+            return {
+                "success": False,
+                "message": data.get("message", "Failed to fetch group participants"),
+            }
+
+        participants = data.get("participants") or []
+        wa_conn = _open_whatsapp_db()
+        msg_conn = sqlite3.connect(MESSAGES_DB_PATH)
+        try:
+            has_tags_table = bool(
+                msg_conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='group_member_tags'"
+                ).fetchone()
+            )
+            db_tags: dict[str, str] = {}
+            if has_tags_table:
+                for user_jid, tag in msg_conn.execute(
+                    "SELECT user_jid, member_tag FROM group_member_tags WHERE chat_jid = ? AND member_tag != ''",
+                    (chat_jid,),
+                ).fetchall():
+                    db_tags[user_jid] = tag
+                    if "@" in user_jid:
+                        db_tags[user_jid.split("@")[0]] = tag
+
+            enriched = []
+            for p in participants:
+                raw_jid = p.get("jid", "")
+                lid = p.get("lid", "")
+                phone = p.get("phone_number", "")
+                name = p.get("name", "")
+                role = p.get("role", "member")
+                member_tag = p.get("member_tag", "")
+
+                if not name or name == phone or raw_jid.endswith("@lid"):
+                    lookup_id = lid or raw_jid or phone
+                    res_name, res_phone, res_jid = _resolve_identity(
+                        lookup_id, wa_conn=wa_conn, msg_conn=msg_conn
+                    )
+                    if res_jid and not res_jid.endswith("@lid"):
+                        raw_jid = res_jid
+                    if res_phone:
+                        phone = res_phone
+                    if res_name and (not name or name == phone or name == lid.split("@")[0]):
+                        name = res_name
+
+                if not member_tag and db_tags:
+                    for key in (
+                        raw_jid,
+                        lid,
+                        f"{phone}@s.whatsapp.net" if phone else "",
+                        phone,
+                        lid.split("@")[0] if "@" in lid else lid,
+                    ):
+                        if key and key in db_tags:
+                            member_tag = db_tags[key]
+                            break
+
+                enriched.append({
+                    "jid": raw_jid,
+                    "phone_number": phone,
+                    "lid": lid,
+                    "name": name or phone or raw_jid,
+                    "role": role,
+                    "member_tag": member_tag,
+                })
+
+            return {
+                "success": True,
+                "group_jid": data.get("group_jid", chat_jid),
+                "group_name": data.get("group_name", ""),
+                "participant_count": len(enriched),
+                "participants": enriched,
+            }
+        finally:
+            if wa_conn is not None:
+                wa_conn.close()
+            msg_conn.close()
+    except requests.RequestException as e:
+        return {"success": False, "message": f"Request error: {str(e)}"}
+    except Exception as e:
+        return {"success": False, "message": f"Unexpected error: {str(e)}"}

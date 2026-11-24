@@ -12,7 +12,8 @@ from whatsapp import (
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
-    download_media as whatsapp_download_media
+    download_media as whatsapp_download_media,
+    get_group_participants as whatsapp_get_group_participants,
 )
 
 # Initialize FastMCP server
@@ -251,6 +252,18 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "success": False,
             "message": "Failed to download media"
         }
+
+@mcp.tool(structured_output=False)
+def get_group_participants(chat_jid: str) -> Dict[str, Any]:
+    """List all participants of a WhatsApp group with resolved names, phone numbers, roles, and group member tags.
+    
+    Args:
+        chat_jid: The JID of the group chat (must end with "@g.us")
+    
+    Returns:
+        A dictionary containing group metadata and a list of participants with jid, phone_number, lid, name, role, and member_tag
+    """
+    return whatsapp_get_group_participants(chat_jid)
 
 if __name__ == "__main__":
     # Initialize and run the server
