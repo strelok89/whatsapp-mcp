@@ -140,6 +140,8 @@ func runAgyAndReply(client *whatsmeow.Client, chatJID, chatName, prompt string, 
 		}
 	}
 
+	reply = "🤖 [Gemini Bot]: " + reply
+
 	recipientJID, err := parseRecipientJID(chatJID)
 	if err != nil {
 		logger.Warnf("Failed to parse chat JID for !agy reply: %v", err)
