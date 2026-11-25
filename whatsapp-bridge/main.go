@@ -12,10 +12,12 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -42,6 +44,118 @@ type Message struct {
 	IsFromMe  bool
 	MediaType string
 	Filename  string
+}
+
+var (
+	bridgeStartTime = time.Now()
+	botSentIDs      sync.Map
+	chatAgyLocks    sync.Map
+)
+
+func getAgyTriggerPrefix() string {
+	prefix := strings.TrimSpace(os.Getenv("AGY_TRIGGER_PREFIX"))
+	if prefix == "" {
+		return "!agy"
+	}
+	return prefix
+}
+
+func extractAgyPrompt(content string) (string, bool) {
+	trimmed := strings.TrimSpace(content)
+	prefix := getAgyTriggerPrefix()
+	if len(trimmed) <= len(prefix) {
+		return "", false
+	}
+	if !strings.EqualFold(trimmed[:len(prefix)], prefix) {
+		return "", false
+	}
+	next := trimmed[len(prefix)]
+	if next != ' ' && next != '\t' && next != '\n' && next != '\r' {
+		return "", false
+	}
+	prompt := strings.TrimSpace(trimmed[len(prefix):])
+	if prompt == "" {
+		return "", false
+	}
+	return prompt, true
+}
+
+func findAgyBinary() (string, error) {
+	if p, err := exec.LookPath("agy"); err == nil {
+		return p, nil
+	}
+	if localAppData := os.Getenv("LOCALAPPDATA"); localAppData != "" {
+		candidate := filepath.Join(localAppData, "agy", "bin", "agy.exe")
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate, nil
+		}
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		candidate := filepath.Join(home, ".gemini", "antigravity-cli", "bin", "agy.exe")
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("agy executable not found in PATH")
+}
+
+func runAgyAndReply(client *whatsmeow.Client, chatJID, chatName, prompt string, logger waLog.Logger) {
+	lockVal, _ := chatAgyLocks.LoadOrStore(chatJID, &sync.Mutex{})
+	mu := lockVal.(*sync.Mutex)
+	mu.Lock()
+	defer mu.Unlock()
+
+	agyBin, err := findAgyBinary()
+	if err != nil {
+		logger.Warnf("Cannot run !agy trigger: %v", err)
+		return
+	}
+
+	fullPrompt := fmt.Sprintf(
+		"Triggered from WhatsApp chat %q (JID: %s).\nRespond concisely as plain text suitable for a WhatsApp reply.\n\nUser request:\n%s",
+		chatName, chatJID, prompt,
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, agyBin, "-p", fullPrompt, "--output-format", "text")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	logger.Infof("Running !agy trigger in %s", chatJID)
+	runErr := cmd.Run()
+
+	reply := strings.TrimSpace(stdout.String())
+	if reply == "" {
+		errText := strings.TrimSpace(stderr.String())
+		if runErr != nil {
+			reply = fmt.Sprintf("agy error: %v", runErr)
+			if errText != "" {
+				reply = fmt.Sprintf("agy error: %v (%s)", runErr, errText)
+			}
+		} else {
+			reply = "(agy returned an empty response)"
+		}
+	}
+
+	recipientJID, err := parseRecipientJID(chatJID)
+	if err != nil {
+		logger.Warnf("Failed to parse chat JID for !agy reply: %v", err)
+		return
+	}
+
+	resp, err := client.SendMessage(context.Background(), recipientJID, &waProto.Message{
+		Conversation: proto.String(reply),
+	})
+	if err != nil {
+		logger.Warnf("Failed to send !agy reply to %s: %v", chatJID, err)
+		return
+	}
+	if resp.ID != "" {
+		botSentIDs.Store(resp.ID, true)
+	}
 }
 
 // Database handler for storing message history
@@ -645,6 +759,15 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			fmt.Printf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, sender, mediaType, filename, content)
 		} else if content != "" {
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
+		}
+
+		// Trigger Antigravity on "!agy <prompt>" from self on live messages
+		if msg.Info.IsFromMe && msg.Info.Timestamp.After(bridgeStartTime.Add(-2*time.Second)) {
+			if _, isBotReply := botSentIDs.LoadAndDelete(msg.Info.ID); !isBotReply {
+				if prompt, ok := extractAgyPrompt(content); ok {
+					go runAgyAndReply(client, chatJID, name, prompt, logger)
+				}
+			}
 		}
 	}
 }
